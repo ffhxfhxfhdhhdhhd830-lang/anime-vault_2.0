@@ -1131,7 +1131,8 @@ def help_text():
         "/recommendations · /top · /movies · /series\n"
         "/wtw &lt;title&gt; · /progress · /continue · /stats · /export\n\n"
         "<b>ᴏᴡɴᴇʀ ᴏɴʟʏ</b>\n"
-        "/users · /pending_users · /allow &lt;id&gt; · /deny &lt;id&gt;\n"
+        "/users · /pending_users · /info [id] · /id\n"
+        "/totalrequests · /purgerequests CONFIRM · /allow &lt;id&gt; · /deny &lt;id&gt;\n"
         "/approve &lt;id&gt; · /reject &lt;id&gt; · /block &lt;id&gt; · /unblock &lt;id&gt; · /health"
     )
 
@@ -1224,8 +1225,84 @@ async def start(update, context):
 
 
 async def whoami(update, context):
+    user = update.effective_user
+    chat = update.effective_chat
+    username = f"@{user.username}" if user.username else "not set"
     await update.effective_message.reply_text(
-        f"Your Telegram numeric ID: {update.effective_user.id}"
+        f"User ID: {user.id}\nChat ID: {chat.id if chat else 'unknown'}\n"
+        f"Username: {username}"
+    )
+
+
+async def info_cmd(update, context):
+    user = update.effective_user
+    args = getattr(context, "args", []) or []
+    if args and not args[0].isdigit():
+        return await update.effective_message.reply_text("Usage: /info [telegram_user_id]")
+    target_id = int(args[0]) if args else user.id
+    if not await allowed(update, context, owner=(target_id != user.id)):
+        return
+    db = context.application.bot_data["db"]
+    record = await db.users.find_one({"user_id": target_id}) or {}
+    request = await db.access_requests.find_one({"user_id": target_id}) or {}
+    access = await db.authorized_users.find_one({"user_id": target_id}) or {}
+    name = record.get("first_name") or request.get("name") or request.get("first_name") or "Unknown"
+    username = record.get("username") or request.get("username")
+    status = (
+        "blocked" if access.get("blocked") else
+        "authorized" if access else
+        str(request.get("status", "not registered"))
+    )
+    registered = record.get("registered_at")
+    last_seen = record.get("last_seen_at")
+    details = [
+        "<b>Telegram user info</b>",
+        f"Name: {html.escape(str(name))}",
+        f"User ID: <code>{target_id}</code>",
+        f"Username: {html.escape('@' + str(username) if username else 'not set')}",
+        f"Access: {html.escape(status)}",
+        f"Registered: {html.escape(str(registered or 'unknown'))}",
+        f"Last seen: {html.escape(str(last_seen or 'unknown'))}",
+    ]
+    await update.effective_message.reply_text("\n".join(details), parse_mode=ParseMode.HTML)
+
+
+async def totalrequests_cmd(update, context):
+    if not await allowed(update, context, owner=True):
+        return
+    db = context.application.bot_data["db"]
+    total = await db.access_requests.count_documents({})
+    pending = await db.access_requests.count_documents({"status": "pending"})
+    approved = await db.access_requests.count_documents({"status": "approved"})
+    rejected = await db.access_requests.count_documents({"status": "rejected"})
+    await update.effective_message.reply_text(
+        f"Access requests\nTotal: {total}\nPending: {pending}\n"
+        f"Approved: {approved}\nRejected: {rejected}"
+    )
+
+
+async def purgerequests_cmd(update, context):
+    if not await allowed(update, context, owner=True):
+        return
+    db = context.application.bot_data["db"]
+    total = await db.access_requests.count_documents({})
+    args = getattr(context, "args", []) or []
+    if not args or args[0].upper() != "CONFIRM":
+        return await update.effective_message.reply_text(
+            f"This will permanently delete all {total} access-request records, including reviewed requests.\n"
+            "To confirm, send /purgerequests CONFIRM"
+        )
+    result = await db.access_requests.delete_many({})
+    await db.audit.insert_one(
+        {
+            "actor_id": update.effective_user.id,
+            "action": "purge_access_requests",
+            "deleted_count": result.deleted_count,
+            "at": datetime.now(timezone.utc),
+        }
+    )
+    await update.effective_message.reply_text(
+        f"Deleted {result.deleted_count} access-request records. Authorized users were not changed."
     )
 
 
@@ -1968,6 +2045,10 @@ def build_app():
         "about": about_cmd,
         "menu": menu,
         "whoami": whoami,
+        "id": whoami,
+        "info": info_cmd,
+        "totalrequests": totalrequests_cmd,
+        "purgerequests": purgerequests_cmd,
         "search": search,
         "add": add,
         "delete": delete_cmd,
